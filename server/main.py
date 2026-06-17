@@ -36,7 +36,7 @@ from tts_edge import synthesize
 from web_search import direct_answer_from_results, format_search_results, search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
 app = FastAPI(title="Smart Pillow Cloud Server")
-APP_VERSION = "continuous_dialog_v1"
+APP_VERSION = "continuous_dialog_v2"
 
 WAKE_TRIGGER_TEXT = "__wake__"
 WAKE_REPLY_TEXT = "我在，你说。"
@@ -119,17 +119,26 @@ async def send_tts_stream_to_esp32(
             "turn_id": turn_id
         }, ensure_ascii=False))
 
-    # 第二步：后台合成 TTS，同时每 300ms 发心跳防止 TCP 空闲断开
+    # 第二步：后台合成 TTS，Opus 帧一产出就发送，减少合成后的等待
     queue: asyncio.Queue = asyncio.Queue()
 
     async def _synth_to_queue():
-        async for frame in synthesize(text):
-            if frame:
-                await queue.put(frame)
-        await queue.put(None)  # 完成信号
+        try:
+            async for frame in synthesize(text):
+                if frame:
+                    await queue.put(frame)
+        finally:
+            await queue.put(None)  # 完成信号
+
+    async def _send_payload(payload) -> bool:
+        async with lock:
+            if source == "assistant" and not is_current_turn(client_id, turn_id):
+                return False
+            await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+        return True
 
     synth_task = asyncio.create_task(_synth_to_queue())
-    opus_frames: list[bytes] = []
+    seq = 0
 
     try:
         while True:
@@ -139,54 +148,46 @@ async def send_tts_stream_to_esp32(
             except asyncio.TimeoutError:
                 get_task.cancel()
                 # 300ms 无帧 → 发心跳保活
-                try:
-                    await websocket.send_text('{"type":"ping"}')
-                except Exception:
-                    synth_task.cancel()
+                if not await _send_payload({"type": "ping"}):
                     return False
                 continue
 
-            if frame is None:  # 合成完成
+            if frame is None:
                 break
-            opus_frames.append(frame)
+
+            seq += 1
+            if not await _send_payload({
+                "type": "tts_audio_chunk",
+                "codec": "opus",
+                "seq": seq,
+                "source": source,
+                "turn_id": turn_id,
+                "audio": base64.b64encode(frame).decode()
+            }):
+                return False
     finally:
-        synth_task.cancel()
+        if not synth_task.done():
+            synth_task.cancel()
 
     if source == "assistant" and not is_current_turn(client_id, turn_id):
         return False
 
-    if not opus_frames:
+    if seq <= 0:
         return False
 
-    # 第三步：锁内一口气发送所有 chunk + end
-    async with lock:
-        if source == "assistant" and not is_current_turn(client_id, turn_id):
-            return False
+    if not await _send_payload({
+        "type": "tts_audio_end",
+        "codec": "opus",
+        "text": text,
+        "chunks": seq,
+        "source": source,
+        "turn_id": turn_id,
+        "dialog_end": end_dialog
+    }):
+        return False
 
-        print(f"[TTS-send] 发送 {len(opus_frames)} 个 chunk")
-        for i, frame in enumerate(opus_frames, 1):
-            await websocket.send_text(json.dumps({
-                "type": "tts_audio_chunk",
-                "codec": "opus",
-                "seq": i,
-                "source": source,
-                "turn_id": turn_id,
-                "audio": base64.b64encode(frame).decode()
-            }, ensure_ascii=False))
-
-        await websocket.send_text(json.dumps({
-            "type": "tts_audio_end",
-            "codec": "opus",
-            "text": text,
-            "chunks": len(opus_frames),
-            "source": source,
-            "turn_id": turn_id,
-            "dialog_end": end_dialog
-        }, ensure_ascii=False))
-
-    print(f"[TTS-send] 全部完成, {len(opus_frames)} 帧")
+    print(f"[TTS-send] 全部完成, {seq} 帧")
     return True
-
 
 async def send_pc_command(pc_command: dict, client_id: str, turn_id: int) -> bool:
     """把 LLM 产生的电脑控制命令转发给任意一个已连接的 PC Agent。"""

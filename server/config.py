@@ -9,7 +9,7 @@
 配置项说明：
   - XF_*: 讯飞开放平台的语音识别凭证
   - DEEPSEEK_*: DeepSeek LLM 的 API 配置
-  - TTS_VOICE: Edge TTS 的音色名称（可选值见 edge-tts --list-voices）
+  - TTS_VOICE/TTS_RATE/TTS_VOLUME: Edge TTS 的音色、语速和音量
   - SERVER_*: WebSocket 服务监听地址和端口
 """
 import os
@@ -37,8 +37,10 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 # 常用中文音色：zh-CN-XiaoxiaoNeural（女）、zh-CN-YunxiNeural（男）
 # 风格：assistant, chat, gentle, narration-relaxed, empathetic, affectionate
 TTS_VOICE = os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
-# 语速：睡眠助手用负值慢速，如 "-10%"
-TTS_RATE = os.getenv("TTS_RATE", "-10%")
+# 语速：默认正常语速，减少语音回复前后的拖沓感
+TTS_RATE = os.getenv("TTS_RATE", "+0%")
+# 音量：略微提高输出，避免设备端听感偏弱
+TTS_VOLUME = os.getenv("TTS_VOLUME", "+15%")
 # 语调风格：gentle(温柔) / narration-relaxed(放松叙述) / empathetic(共情)
 TTS_STYLE = os.getenv("TTS_STYLE", "gentle")
 # 风格强度 0.0~1.0

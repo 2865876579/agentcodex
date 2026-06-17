@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 import edge_tts
 import miniaudio
 import opuslib
-from config import TTS_VOICE, TTS_RATE
+from config import TTS_VOICE, TTS_RATE, TTS_VOLUME
 
 # Opus 参数
 SAMPLE_RATE = 16000
@@ -29,9 +29,9 @@ async def synthesize(text: str) -> AsyncIterator[bytes]:
     import time as _time
     _t0 = _time.monotonic()
     try:
-        # 1. Edge TTS → MP3（纯文本 + 慢语速，不用 SSML 避免解析异常）
-        print(f"[TTS] Step1: Edge TTS 开始, voice={TTS_VOICE}, rate={TTS_RATE}")
-        communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
+        # 1. Edge TTS → MP3（纯文本 + 配置语速/音量，不用 SSML 避免解析异常）
+        print(f"[TTS] Step1: Edge TTS 开始, voice={TTS_VOICE}, rate={TTS_RATE}, volume={TTS_VOLUME}")
+        communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE, volume=TTS_VOLUME)
         mp3_chunks: list[bytes] = []
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
