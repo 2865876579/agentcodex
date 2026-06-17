@@ -36,7 +36,19 @@ from tts_edge import synthesize
 from web_search import direct_answer_from_results, format_search_results, search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
 app = FastAPI(title="Smart Pillow Cloud Server")
-APP_VERSION = "search_intent_interrupt_v4"
+APP_VERSION = "continuous_dialog_v1"
+
+WAKE_TRIGGER_TEXT = "__wake__"
+WAKE_REPLY_TEXT = "我在，你说。"
+EXIT_REPLY_TEXT = "好的，再见小智。"
+EXIT_PHRASES = (
+    "再见小智",
+    "再见小知",
+    "小智再见",
+    "拜拜小智",
+    "退出对话",
+    "结束对话",
+)
 
 # 存储已连接的 PC Agent，key 是连接 id，value 是 WebSocket 对象
 # 当 LLM 返回电脑控制命令时，会从这里取一个 Agent 转发命令
@@ -48,6 +60,11 @@ esp32_send_locks: dict[str, asyncio.Lock] = {}
 esp32_sessions: dict[str, dict] = {}
 pc_command_contexts: dict[str, dict] = {}
 last_active_esp32_id: str | None = None
+
+
+def is_exit_phrase(text: str) -> bool:
+    normalized = re.sub(r"[\s，。！？、,.!?~～]", "", text or "")
+    return any(phrase in normalized for phrase in EXIT_PHRASES)
 
 
 async def send_json_to_esp32(client_id: str, payload: dict) -> bool:
@@ -68,6 +85,7 @@ async def send_tts_stream_to_esp32(
     *,
     source: str = "assistant",
     turn_id: int | None = None,
+    end_dialog: bool = False,
 ) -> bool:
     """
     TTS 音频流式发送到 ESP32（binary frame + Opus 编码，对齐小智协议）。
@@ -162,7 +180,8 @@ async def send_tts_stream_to_esp32(
             "text": text,
             "chunks": len(opus_frames),
             "source": source,
-            "turn_id": turn_id
+            "turn_id": turn_id,
+            "dialog_end": end_dialog
         }, ensure_ascii=False))
 
     print(f"[TTS-send] 全部完成, {len(opus_frames)} 帧")
@@ -284,6 +303,16 @@ async def cancel_active_task(client_id: str) -> None:
 
 async def process_text_turn(client_id: str, text: str, history: list[dict], turn_id: int) -> None:
     try:
+        if text == WAKE_TRIGGER_TEXT:
+            await send_tts_stream_to_esp32(client_id, WAKE_REPLY_TEXT, turn_id=turn_id)
+            return
+
+        if is_exit_phrase(text):
+            await send_tts_stream_to_esp32(
+                client_id, EXIT_REPLY_TEXT, turn_id=turn_id, end_dialog=True
+            )
+            return
+
         result = await chat(text, history)
         if not is_current_turn(client_id, turn_id):
             return
@@ -335,6 +364,12 @@ async def process_audio_turn(client_id: str, audio_b64: str, history: list[dict]
             "text": text,
             "turn_id": turn_id
         })
+
+        if is_exit_phrase(text):
+            await send_tts_stream_to_esp32(
+                client_id, EXIT_REPLY_TEXT, turn_id=turn_id, end_dialog=True
+            )
+            return
 
         result = await chat(text, history)
         if not is_current_turn(client_id, turn_id):
