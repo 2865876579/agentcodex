@@ -1,0 +1,11 @@
+# Auto-detect text files, convert CRLF to LF on commit
+* text=auto
+
+# C source / config must be LF
+*.c text eol=lf
+*.h text eol=lf
+*.txt text eol=lf
+CMakeLists.txt text eol=lf
+
+# Batch files can be CRLF
+*.bat text eol=crlf
