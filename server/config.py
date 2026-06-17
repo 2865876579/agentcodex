@@ -24,6 +24,9 @@ load_dotenv()
 XF_APP_ID = os.getenv("XF_APP_ID", "")
 XF_API_KEY = os.getenv("XF_API_KEY", "")
 XF_API_SECRET = os.getenv("XF_API_SECRET", "")
+# 服务端收到的是已完成并截断的录音，快速发送给讯飞以降低回答延迟
+XF_STT_SEND_INTERVAL_SEC = float(os.getenv("XF_STT_SEND_INTERVAL_SEC", "0.005"))
+XF_VAD_EOS_MS = int(os.getenv("XF_VAD_EOS_MS", "800"))
 
 # ==================== DeepSeek LLM 配置 ====================
 # 注册地址：https://platform.deepseek.com/

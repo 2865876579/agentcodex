@@ -20,6 +20,7 @@ import json
 import asyncio
 import base64
 import re
+import opuslib
 
 # Windows 控制台默认 GBK，强制 UTF-8 避免 emoji 打印崩溃
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -36,7 +37,7 @@ from tts_edge import synthesize
 from web_search import direct_answer_from_results, format_search_results, search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
 app = FastAPI(title="Smart Pillow Cloud Server")
-APP_VERSION = "continuous_dialog_v2"
+APP_VERSION = "continuous_dialog_v3_opus_upload"
 
 WAKE_TRIGGER_TEXT = "__wake__"
 WAKE_REPLY_TEXT = "我在，你说。"
@@ -49,6 +50,11 @@ EXIT_PHRASES = (
     "退出对话",
     "结束对话",
 )
+
+PCM_FRAME_BYTES = 1280
+OPUS_SAMPLE_RATE = 16000
+OPUS_CHANNELS = 1
+OPUS_FRAME_SAMPLES = 960
 
 # 存储已连接的 PC Agent，key 是连接 id，value 是 WebSocket 对象
 # 当 LLM 返回电脑控制命令时，会从这里取一个 Agent 转发命令
@@ -336,16 +342,25 @@ async def process_text_turn(client_id: str, text: str, history: list[dict], turn
                 pass
 
 
-async def process_audio_turn(client_id: str, audio_b64: str, history: list[dict], turn_id: int) -> None:
+def split_pcm_frames(audio_bytes: bytes) -> list[bytes]:
+    return [
+        audio_bytes[i:i + PCM_FRAME_BYTES]
+        for i in range(0, len(audio_bytes), PCM_FRAME_BYTES)
+        if audio_bytes[i:i + PCM_FRAME_BYTES]
+    ]
+
+
+async def process_audio_frames_turn(client_id: str, frames: list[bytes], history: list[dict], turn_id: int, source: str) -> None:
     try:
-        print(f"[Audio] received turn_id={turn_id}, b64_len={len(audio_b64)}")
-        audio_bytes = base64.b64decode(audio_b64)
-        frame_size = 1280
-        frames = [
-            audio_bytes[i:i + frame_size]
-            for i in range(0, len(audio_bytes), frame_size)
-        ]
-        print(f"[Audio] decoded bytes={len(audio_bytes)}, frames={len(frames)}")
+        total_bytes = sum(len(frame) for frame in frames)
+        print(f"[Audio] {source} turn_id={turn_id}, frames={len(frames)}, bytes={total_bytes}")
+        if not frames:
+            await send_json_to_esp32(client_id, {
+                "type": "status",
+                "msg": "没收到音频，请再说一次",
+                "turn_id": turn_id
+            })
+            return
 
         text = await recognize(frames)
         if not is_current_turn(client_id, turn_id):
@@ -394,6 +409,13 @@ async def process_audio_turn(client_id: str, audio_b64: str, history: list[dict]
                 pass
 
 
+async def process_audio_turn(client_id: str, audio_b64: str, history: list[dict], turn_id: int) -> None:
+    print(f"[Audio] received legacy turn_id={turn_id}, b64_len={len(audio_b64)}")
+    audio_bytes = base64.b64decode(audio_b64)
+    frames = split_pcm_frames(audio_bytes)
+    await process_audio_frames_turn(client_id, frames, history, turn_id, "legacy_pcm")
+
+
 @app.websocket("/ws/esp32")
 async def esp32_endpoint(websocket: WebSocket):
     """
@@ -430,12 +452,29 @@ async def esp32_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # 等待 ESP32 发来的消息
-            message = await websocket.receive_text()
-            data = json.loads(message)
+            # 等待 ESP32 发来的消息：text JSON 控制帧 + binary Opus 音频帧
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect
             last_active_esp32_id = client_id
 
             try:
+                if "bytes" in message and message["bytes"] is not None:
+                    incoming = esp32_sessions[client_id].get("incoming_audio")
+                    if not incoming:
+                        print(f"[ESP32] drop binary audio without audio_start, bytes={len(message['bytes'])}")
+                        continue
+                    pcm = incoming["decoder"].decode(message["bytes"], OPUS_FRAME_SAMPLES)
+                    incoming["pcm"].extend(pcm)
+                    incoming["chunks"] += 1
+                    incoming["opus_bytes"] += len(message["bytes"])
+                    continue
+
+                if "text" not in message or message["text"] is None:
+                    continue
+
+                data = json.loads(message["text"])
+
                 # ========== 文字模式（调试用，跳过 STT）==========
                 if data.get("type") == "text":
                     text = str(data["text"]).strip()
@@ -443,19 +482,50 @@ async def esp32_endpoint(websocket: WebSocket):
                         continue
                     turn_id = next_turn_id(client_id)
                     await cancel_active_task(client_id)
+                    esp32_sessions[client_id].pop("incoming_audio", None)
                     print(f"[Text] {text}")
 
                     task = asyncio.create_task(process_text_turn(client_id, text, history, turn_id))
                     esp32_sessions[client_id]["active_task"] = task
 
-                # ========== 语音模式（正式流程：STT -> LLM -> TTS）==========
+                # ========== 兼容旧 PCM/base64 语音消息 ==========
                 elif data.get("type") == "audio":
                     audio_b64 = data["audio"]
                     turn_id = next_turn_id(client_id)
                     await cancel_active_task(client_id)
-                    print(f"[ESP32] audio message turn_id={turn_id}, b64_len={len(audio_b64)}")
+                    esp32_sessions[client_id].pop("incoming_audio", None)
+                    print(f"[ESP32] legacy audio turn_id={turn_id}, b64_len={len(audio_b64)}")
 
                     task = asyncio.create_task(process_audio_turn(client_id, audio_b64, history, turn_id))
+                    esp32_sessions[client_id]["active_task"] = task
+
+                # ========== 新 Opus 上传：开始 ==========
+                elif data.get("type") == "audio_start":
+                    turn_id = next_turn_id(client_id)
+                    await cancel_active_task(client_id)
+                    esp32_sessions[client_id]["incoming_audio"] = {
+                        "turn_id": turn_id,
+                        "pcm": bytearray(),
+                        "decoder": opuslib.Decoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS),
+                        "chunks": 0,
+                        "opus_bytes": 0,
+                    }
+                    print(f"[ESP32] opus audio_start turn_id={turn_id}")
+
+                # ========== 新 Opus 上传：结束 ==========
+                elif data.get("type") == "audio_end":
+                    incoming = esp32_sessions[client_id].pop("incoming_audio", None)
+                    if not incoming:
+                        print("[ESP32] audio_end without audio_start")
+                        continue
+                    turn_id = int(incoming["turn_id"])
+                    pcm_bytes = bytes(incoming["pcm"])
+                    frames = split_pcm_frames(pcm_bytes)
+                    print(
+                        f"[ESP32] opus audio_end turn_id={turn_id}, "
+                        f"chunks={incoming['chunks']}, opus_bytes={incoming['opus_bytes']}, pcm_bytes={len(pcm_bytes)}"
+                    )
+                    task = asyncio.create_task(process_audio_frames_turn(client_id, frames, history, turn_id, "opus"))
                     esp32_sessions[client_id]["active_task"] = task
 
                 # ========== 心跳 ==========

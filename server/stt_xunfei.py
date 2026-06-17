@@ -25,7 +25,7 @@ import json
 import time
 from datetime import datetime
 from urllib.parse import urlencode, urlparse
-from config import XF_APP_ID, XF_API_KEY, XF_API_SECRET
+from config import XF_APP_ID, XF_API_KEY, XF_API_SECRET, XF_STT_SEND_INTERVAL_SEC, XF_VAD_EOS_MS
 
 
 def _create_url():
@@ -121,7 +121,7 @@ async def recognize(audio_frames: list[bytes]) -> str:
             "language": "zh_cn",      # 中文
             "domain": "iat",          # 日常用语
             "accent": "mandarin",     # 普通话
-            "vad_eos": 3000,          # 静音检测：3秒无声自动断句
+            "vad_eos": XF_VAD_EOS_MS,  # 静音检测：服务端已截断音频，这里只做兜底
         }
 
         for i, frame in enumerate(audio_frames):
@@ -146,8 +146,9 @@ async def recognize(audio_frames: list[bytes]) -> str:
                 payload["business"] = business
 
             ws.send(json.dumps(payload))
-            # 每帧间隔 40ms，模拟实时音频流速率
-            time.sleep(0.04)
+            # 已经是完整录音，快速送给讯飞，避免录完再等一遍音频时长。
+            if XF_STT_SEND_INTERVAL_SEC > 0:
+                time.sleep(XF_STT_SEND_INTERVAL_SEC)
 
     def on_error(ws, error):
         """连接出错时结束等待"""
