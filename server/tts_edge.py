@@ -6,12 +6,26 @@ Edge TTS 文字转语音模块 —— Opus 编码版
 
 对齐小智（xiaozhi-esp32）架构：binary frame + Opus 压缩。
 """
+import re
 from collections.abc import AsyncIterator
 
 import edge_tts
 import miniaudio
 import opuslib
 from config import TTS_VOICE, TTS_RATE, TTS_VOLUME
+
+# 匹配 emoji 和特殊符号，TTS 不会读这些
+_EMOJI_RE = re.compile(
+    "[\U0001F300-\U0001FFFF"   # 表情符号、杂项符号
+    "\U0000FE00-\U0000FE0F"    # 变体选择器
+    "\U0000200D"                # 零宽连接符
+    "\U0001F1E0-\U0001F1FF"    # 区域指示符（国旗）
+    "☀-➿"            # 杂项符号
+    "⭐⭕✂✅✨❄❇❌❓-❗❤➕-➗⤴⤵"  # 常见 emoji
+    "▪▫▶◀◻-◾☕☺♈-♓♻♿⚓⚠⚡⚪⚫⚽⚾⛄⛅⛔⛪⛲⛳⛵⛺⛽"  # 更多符号
+    "]",
+    re.UNICODE,
+)
 
 # Opus 参数
 SAMPLE_RATE = 16000
@@ -26,6 +40,11 @@ async def synthesize(text: str) -> AsyncIterator[bytes]:
 
     产出：Opus 编码音频帧（每帧 60ms，约 80-120 字节）
     """
+    # 过滤 emoji，TTS 不认识会读成乱码
+    text = _EMOJI_RE.sub("", text).strip()
+    if not text:
+        return
+
     import time as _time
     _t0 = _time.monotonic()
     try:

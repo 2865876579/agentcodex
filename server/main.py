@@ -20,6 +20,7 @@ import json
 import asyncio
 import base64
 import re
+import uuid
 import opuslib
 
 # Windows 控制台默认 GBK，强制 UTF-8 避免 emoji 打印崩溃
@@ -31,13 +32,13 @@ import time
 import urllib.parse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from config import SERVER_HOST, SERVER_PORT
-from stt_xunfei import recognize
-from llm_deepseek import chat
+from stt_xunfei import recognize, recognize_queue
+from llm_deepseek import chat_stream
 from tts_edge import synthesize
 from web_search import direct_answer_from_results, format_search_results, search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
 app = FastAPI(title="Smart Pillow Cloud Server")
-APP_VERSION = "continuous_dialog_v4_binary_tts"
+APP_VERSION = "xiaozhi_realtime_v5"
 
 WAKE_TRIGGER_TEXT = "__wake__"
 WAKE_REPLY_TEXT = "我在，你说。"
@@ -85,6 +86,57 @@ async def send_json_to_esp32(client_id: str, payload: dict) -> bool:
     return True
 
 
+def session_id_of(client_id: str) -> str:
+    session = esp32_sessions.get(client_id) or {}
+    return session.get("session_id", "")
+
+
+async def send_tts_state_to_esp32(
+    client_id: str,
+    state: str,
+    *,
+    source: str = "assistant",
+    turn_id: int | None = None,
+    end_dialog: bool = False,
+    text: str | None = None,
+) -> bool:
+    payload = {"type": "tts", "state": state}
+    sid = session_id_of(client_id)
+    if sid:
+        payload["session_id"] = sid
+    if state == "stop" and end_dialog:
+        payload["dialog_end"] = True
+    if source != "assistant":
+        payload["source"] = source
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+    if text is not None:
+        payload["text"] = text
+    return await send_json_to_esp32(client_id, payload)
+
+
+async def send_tts_audio_frames_to_esp32(
+    client_id: str,
+    text: str,
+    *,
+    source: str = "assistant",
+    turn_id: int | None = None,
+) -> int:
+    websocket = esp32_clients.get(client_id)
+    lock = esp32_send_locks.get(client_id)
+    if websocket is None or lock is None:
+        return 0
+
+    frame_count = 0
+    async for frame in synthesize(text):
+        if not frame:
+            continue
+        async with lock:
+            await websocket.send_bytes(frame)
+        frame_count += 1
+    return frame_count
+
+
 async def send_tts_stream_to_esp32(
     client_id: str,
     text: str,
@@ -94,103 +146,35 @@ async def send_tts_stream_to_esp32(
     end_dialog: bool = False,
 ) -> bool:
     """
-    TTS 音频流式发送到 ESP32（binary frame + Opus 编码，对齐小智协议）。
-
-    协议：
-      - tts_audio_start：text JSON 帧，含元数据
-      - [binary frame]：Opus 编码音频（每帧 60ms）
-      - tts_audio_end：text JSON 帧，结束标记
+    小智协议 TTS：
+      - {"type":"tts","state":"start"}
+      - binary Opus frames
+      - {"type":"tts","state":"stop"}
     """
-    websocket = esp32_clients.get(client_id)
-    lock = esp32_send_locks.get(client_id)
-    if websocket is None or lock is None:
+    if client_id not in esp32_clients:
         return False
-    if source == "assistant" and not is_current_turn(client_id, turn_id):
+    # ★ AI 回复不应该被 turn_id 拦截——后台任务可能跨多个录音周期
+
+    print(f"[TTS-send] start, text_len={len(text)}")
+    if not await send_tts_state_to_esp32(
+        client_id, "start", source=source, turn_id=turn_id
+    ):
         return False
-
-    # 第一步：立即发送 start（锁内），让 ESP32 知道即将有音频
-    async with lock:
-        if source == "assistant" and not is_current_turn(client_id, turn_id):
-            return False
-
-        print(f"[TTS-send] 发送 tts_audio_start, text_len={len(text)}")
-        await websocket.send_text(json.dumps({
-            "type": "tts_audio_start",
-            "codec": "opus",
-            "sample_rate": 16000,
-            "channels": 1,
-            "frame_duration_ms": 60,
-            "text": text,
-            "source": source,
-            "turn_id": turn_id
-        }, ensure_ascii=False))
-
-    # 第二步：后台合成 TTS，Opus 帧一产出就发送，减少合成后的等待
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def _synth_to_queue():
-        try:
-            async for frame in synthesize(text):
-                if frame:
-                    await queue.put(frame)
-        finally:
-            await queue.put(None)  # 完成信号
-
-    async def _send_payload(payload) -> bool:
-        async with lock:
-            if source == "assistant" and not is_current_turn(client_id, turn_id):
-                return False
-            await websocket.send_text(json.dumps(payload, ensure_ascii=False))
-        return True
-
-    async def _send_binary_frame(frame: bytes) -> bool:
-        async with lock:
-            if source == "assistant" and not is_current_turn(client_id, turn_id):
-                return False
-            await websocket.send_bytes(frame)
-        return True
-
-    synth_task = asyncio.create_task(_synth_to_queue())
-    seq = 0
-
     try:
-        while True:
-            get_task = asyncio.create_task(queue.get())
-            try:
-                frame = await asyncio.wait_for(get_task, timeout=0.3)
-            except asyncio.TimeoutError:
-                get_task.cancel()
-                # 300ms 无帧 → 发心跳保活
-                if not await _send_payload({"type": "ping"}):
-                    return False
-                continue
-
-            if frame is None:
-                break
-
-            seq += 1
-            if not await _send_binary_frame(frame):
-                return False
-    finally:
-        if not synth_task.done():
-            synth_task.cancel()
-
-    if source == "assistant" and not is_current_turn(client_id, turn_id):
+        seq = await send_tts_audio_frames_to_esp32(
+            client_id, text, source=source, turn_id=turn_id
+        )
+    except Exception as exc:
+        print(f"[TTS-send] failed: {exc}")
+        await send_tts_state_to_esp32(
+            client_id, "stop", source=source, turn_id=turn_id, end_dialog=end_dialog
+        )
         return False
 
+    await send_tts_state_to_esp32(
+        client_id, "stop", source=source, turn_id=turn_id, end_dialog=end_dialog
+    )
     if seq <= 0:
-        return False
-
-    if not await _send_payload({
-        "type": "tts_audio_end",
-        "codec": "opus",
-        "text": text,
-        "chunks": seq,
-        "source": source,
-        "turn_id": turn_id,
-        "transport": "binary",
-        "dialog_end": end_dialog
-    }):
         return False
 
     print(f"[TTS-send] 全部完成, {seq} 帧")
@@ -273,25 +257,91 @@ def extract_search_query_from_url(url: str) -> str | None:
 
 
 
-async def handle_ai_result(client_id: str, user_text: str, result: dict, history: list[dict], turn_id: int) -> None:
-    """处理 LLM 返回结果：执行 pc_command（如有），播报语音回复。"""
-    if not is_current_turn(client_id, turn_id):
+def _should_flush_tts(text: str, is_first: bool = False) -> int:
+    """★ xiaozhi 指针法：返回从 text 开头可 flush 的字符数，0=继续缓冲。
+       不 strip()，调用方用指针跟踪已发位置，空白自然占位不丢偏移。"""
+    if not text:
+        return 0
+    last = text[-1]
+    if last in "。！？!?；;：:":
+        return len(text)
+    if is_first:
+        visible = text.lstrip()
+        if visible and visible[-1] in "，、…～":
+            return len(text)
+    if len(text) >= 50:
+        for i in range(len(text) - 2, max(0, len(text) - 35), -1):
+            if text[i] in "。！？!?；;：:，、…～":
+                return i + 1
+        if len(text) >= 80:
+            return len(text)
+    return 0
+
+
+async def handle_ai_stream_result(client_id: str, user_text: str, history: list[dict], turn_id: int) -> None:
+    text_buffer = ""          # 全部原始输出，不清空
+    processed = 0             # 已发送到的位置（指针）
+    full_reply = ""
+    started_tts = False
+    total_frames = 0
+    is_first_sentence = True
+
+    try:
+        async for delta in chat_stream(user_text, history):
+            full_reply += delta
+            text_buffer += delta
+
+            # 一个 delta 可能含多句话，while 循环全部处理完
+            while True:
+                new_part = text_buffer[processed:]
+                n = _should_flush_tts(new_part, is_first=is_first_sentence)
+                if not n:
+                    break
+
+                sentence = text_buffer[processed:processed + n].strip()
+                processed += n
+                if not sentence:
+                    continue
+
+                if not started_tts:
+                    started_tts = await send_tts_state_to_esp32(client_id, "start", turn_id=turn_id)
+                if started_tts:
+                    await send_tts_state_to_esp32(
+                        client_id, "sentence_start", turn_id=turn_id, text=sentence
+                    )
+                    total_frames += await send_tts_audio_frames_to_esp32(
+                        client_id, sentence, turn_id=turn_id
+                    )
+                is_first_sentence = False
+
+        # 收尾：发送剩余未处理文本
+        remaining = text_buffer[processed:].strip()
+        if remaining:
+            if not started_tts:
+                started_tts = await send_tts_state_to_esp32(client_id, "start", turn_id=turn_id)
+            if started_tts:
+                await send_tts_state_to_esp32(
+                    client_id, "sentence_start", turn_id=turn_id, text=remaining
+                )
+                total_frames += await send_tts_audio_frames_to_esp32(
+                    client_id, remaining, turn_id=turn_id
+                )
+    finally:
+        if started_tts:
+            await send_tts_state_to_esp32(client_id, "stop", turn_id=turn_id)
+
+    print(f"[LLM-stream] frames={total_frames}, reply={full_reply.strip()!r}")
+
+
+async def answer_user_text(client_id: str, text: str, history: list[dict], turn_id: int) -> None:
+    if is_exit_phrase(text):
+        await send_tts_stream_to_esp32(
+            client_id, EXIT_REPLY_TEXT, turn_id=turn_id, end_dialog=True
+        )
         return
 
-    reply = result.get("reply", "")
-    pc_command = result.get("pc_command")
-    print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
-
-    if pc_command:
-        sent = await send_pc_command(pc_command, client_id, turn_id)
-        if not sent:
-            await send_json_to_esp32(client_id, {
-                "type": "status",
-                "msg": "没有在线 PC Agent，无法执行电脑控制命令"
-            })
-
-    if reply:
-        await send_tts_stream_to_esp32(client_id, reply, turn_id=turn_id)
+    # ★ xiaozhi 流式：chat_stream 自带 Function Calling，所有对话统一走流式
+    await handle_ai_stream_result(client_id, text, history, turn_id)
 
 
 async def cancel_active_task(client_id: str) -> None:
@@ -315,16 +365,7 @@ async def process_text_turn(client_id: str, text: str, history: list[dict], turn
             await send_tts_stream_to_esp32(client_id, WAKE_REPLY_TEXT, turn_id=turn_id)
             return
 
-        if is_exit_phrase(text):
-            await send_tts_stream_to_esp32(
-                client_id, EXIT_REPLY_TEXT, turn_id=turn_id, end_dialog=True
-            )
-            return
-
-        result = await chat(text, history)
-        if not is_current_turn(client_id, turn_id):
-            return
-        await handle_ai_result(client_id, text, result, history, turn_id)
+        await answer_user_text(client_id, text, history, turn_id)
     except asyncio.CancelledError:
         print(f"[Task] 旧文本任务已取消: turn_id={turn_id}")
         raise
@@ -368,11 +409,7 @@ async def process_audio_frames_turn(client_id: str, frames: list[bytes], history
             return
         print(f"[STT] result_len={len(text.strip())}, text={text!r}")
         if not text.strip():
-            await send_json_to_esp32(client_id, {
-                "type": "status",
-                "msg": "没听清，请再说一次",
-                "turn_id": turn_id
-            })
+            await send_json_to_esp32(client_id, {"type": "status", "turn_id": turn_id})
             return
 
         print(f"[STT] {text}")
@@ -382,16 +419,7 @@ async def process_audio_frames_turn(client_id: str, frames: list[bytes], history
             "turn_id": turn_id
         })
 
-        if is_exit_phrase(text):
-            await send_tts_stream_to_esp32(
-                client_id, EXIT_REPLY_TEXT, turn_id=turn_id, end_dialog=True
-            )
-            return
-
-        result = await chat(text, history)
-        if not is_current_turn(client_id, turn_id):
-            return
-        await handle_ai_result(client_id, text, result, history, turn_id)
+        await answer_user_text(client_id, text, history, turn_id)
     except asyncio.CancelledError:
         print(f"[Task] 旧语音任务已取消: turn_id={turn_id}")
         raise
@@ -417,28 +445,52 @@ async def process_audio_turn(client_id: str, audio_b64: str, history: list[dict]
     await process_audio_frames_turn(client_id, frames, history, turn_id, "legacy_pcm")
 
 
+async def process_realtime_audio(client_id: str, pcm_queue: asyncio.Queue, history: list[dict], turn_id: int) -> None:
+    try:
+        print(f"[Audio] realtime STT start turn_id={turn_id}")
+        text = await recognize_queue(pcm_queue)
+        if not is_current_turn(client_id, turn_id):
+            return
+
+        print(f"[STT] realtime result_len={len(text.strip())}, text={text!r}")
+        if not text.strip():
+            # 空录音 → 发空 status 让 ESP32 继续录，但不设 turn_done？
+            # 不行，ESP32 需要 turn_done 才能重录。改 ESP32 端太复杂。
+            # 这里改用：发 status 让它重录，但 listen start 不 cancel AI 任务
+            await send_json_to_esp32(client_id, {"type": "status", "turn_id": turn_id})
+            return
+
+        await send_json_to_esp32(client_id, {
+            "type": "stt_result",
+            "text": text,
+            "turn_id": turn_id
+        })
+        await answer_user_text(client_id, text, history, turn_id)
+    except asyncio.CancelledError:
+        print(f"[Task] 实时语音任务已取消: turn_id={turn_id}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] 处理实时语音出错: {e}")
+        import traceback
+        traceback.print_exc()
+        if is_current_turn(client_id, turn_id):
+            try:
+                await send_json_to_esp32(client_id, {
+                    "type": "status",
+                    "msg": f"处理出错: {str(e)[:100]}",
+                    "turn_id": turn_id
+                })
+            except Exception:
+                pass
+
+
 @app.websocket("/ws/esp32")
 async def esp32_endpoint(websocket: WebSocket):
     """
-    ESP32 设备的 WebSocket 连接入口
+    ESP32 设备入口。
 
-    支持两种消息类型：
-    1. {"type": "text", "text": "用户说的话"}
-       - 文字模式，跳过 STT，直接送 LLM（用于调试和测试）
-
-    2. {"type": "audio", "audio": "base64编码的PCM音频"}
-       - 语音模式，先 STT 转文字，再送 LLM
-       - 音频格式要求：16kHz 采样率，16bit，单声道，PCM 原始数据
-
-    3. {"type": "ping"} - 心跳保活
-
-    返回消息类型：
-    - {"type": "tts_audio_start", "format": "mp3", "text": "回复文字"}
-    - {"type": "tts_audio_chunk", "format": "mp3", "seq": 1, "audio": "base64音频块"}
-    - {"type": "tts_audio_end", "format": "mp3", "text": "回复文字", "chunks": 12}
-    - {"type": "stt_result", "text": "识别出的文字"}
-    - {"type": "status", "msg": "状态提示"}
-    - {"type": "pong"}
+    新协议：hello / listen start / binary Opus / listen stop / tts start|stop。
+    同时保留 text、audio、audio_start、audio_end 等旧测试入口。
     """
     global last_active_esp32_id
 
@@ -463,10 +515,19 @@ async def esp32_endpoint(websocket: WebSocket):
                 if "bytes" in message and message["bytes"] is not None:
                     incoming = esp32_sessions[client_id].get("incoming_audio")
                     if not incoming:
-                        print(f"[ESP32] drop binary audio without audio_start, bytes={len(message['bytes'])}")
+                        print(f"[ESP32] drop binary audio without listen start, bytes={len(message['bytes'])}")
                         continue
-                    pcm = incoming["decoder"].decode(message["bytes"], OPUS_FRAME_SAMPLES)
-                    incoming["pcm"].extend(pcm)
+                    pcm = incoming["decoder"].decode(
+                        message["bytes"], OPUS_FRAME_SAMPLES
+                    )
+                    if "pcm_queue" in incoming:
+                        incoming["pcm_buffer"].extend(pcm)
+                        while len(incoming["pcm_buffer"]) >= PCM_FRAME_BYTES:
+                            frame = bytes(incoming["pcm_buffer"][:PCM_FRAME_BYTES])
+                            del incoming["pcm_buffer"][:PCM_FRAME_BYTES]
+                            incoming["pcm_queue"].put_nowait(frame)
+                    else:
+                        incoming["pcm"].extend(pcm)
                     incoming["chunks"] += 1
                     incoming["opus_bytes"] += len(message["bytes"])
                     continue
@@ -475,9 +536,80 @@ async def esp32_endpoint(websocket: WebSocket):
                     continue
 
                 data = json.loads(message["text"])
+                msg_type = data.get("type")
+
+                if msg_type == "hello":
+                    session_id = data.get("session_id") or uuid.uuid4().hex[:12]
+                    esp32_sessions[client_id]["session_id"] = session_id
+                    esp32_sessions[client_id]["audio_params"] = data.get("audio_params", {})
+                    await send_json_to_esp32(client_id, {
+                        "type": "hello",
+                        "session_id": session_id,
+                        "server_version": APP_VERSION,
+                        "audio_params": {
+                            "format": "opus",
+                            "sample_rate": OPUS_SAMPLE_RATE,
+                            "channels": OPUS_CHANNELS,
+                            "frame_duration": 60,
+                        },
+                    })
+                    print(f"[ESP32] hello session_id={session_id}, version={data.get('version')}")
+                    continue
+
+                if msg_type == "listen":
+                    state = data.get("state")
+                    if state == "start":
+                        turn_id = next_turn_id(client_id)
+                        # ★ 不 cancel——让 AI 任务自然跑完
+                        pcm_queue: asyncio.Queue = asyncio.Queue()
+                        esp32_sessions[client_id]["incoming_audio"] = {
+                            "turn_id": turn_id,
+                            "pcm_queue": pcm_queue,
+                            "pcm_buffer": bytearray(),
+                            "decoder": opuslib.Decoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS),
+                            "chunks": 0,
+                            "opus_bytes": 0,
+                        }
+                        task = asyncio.create_task(
+                            process_realtime_audio(client_id, pcm_queue, history, turn_id)
+                        )
+                        esp32_sessions[client_id]["active_task"] = task
+                        print(f"[ESP32] listen start turn_id={turn_id}, mode={data.get('mode')}")
+                    elif state == "stop":
+                        incoming = esp32_sessions[client_id].pop("incoming_audio", None)
+                        if not incoming:
+                            print("[ESP32] listen stop without listen start")
+                            continue
+                        if incoming.get("pcm_buffer"):
+                            await incoming["pcm_queue"].put(bytes(incoming["pcm_buffer"]))
+                        await incoming["pcm_queue"].put(None)
+                        print(
+                            f"[ESP32] listen stop turn_id={incoming['turn_id']}, "
+                            f"chunks={incoming['chunks']}, opus_bytes={incoming['opus_bytes']}"
+                        )
+                    elif state == "detect":
+                        print(f"[ESP32] wake detected: {data.get('text', '')}")
+                        turn_id = next_turn_id(client_id)
+                        await cancel_active_task(client_id)
+                        task = asyncio.create_task(
+                            send_tts_stream_to_esp32(
+                                client_id,
+                                WAKE_REPLY_TEXT,
+                                turn_id=turn_id,
+                            )
+                        )
+                        esp32_sessions[client_id]["active_task"] = task
+                    continue
+
+                if msg_type == "abort":
+                    esp32_sessions[client_id].pop("incoming_audio", None)
+                    await cancel_active_task(client_id)
+                    await send_tts_state_to_esp32(client_id, "stop")
+                    print(f"[ESP32] abort reason={data.get('reason')}")
+                    continue
 
                 # ========== 文字模式（调试用，跳过 STT）==========
-                if data.get("type") == "text":
+                if msg_type == "text":
                     text = str(data["text"]).strip()
                     if not text:
                         continue
@@ -490,7 +622,7 @@ async def esp32_endpoint(websocket: WebSocket):
                     esp32_sessions[client_id]["active_task"] = task
 
                 # ========== 兼容旧 PCM/base64 语音消息 ==========
-                elif data.get("type") == "audio":
+                elif msg_type == "audio":
                     audio_b64 = data["audio"]
                     turn_id = next_turn_id(client_id)
                     await cancel_active_task(client_id)
@@ -501,7 +633,7 @@ async def esp32_endpoint(websocket: WebSocket):
                     esp32_sessions[client_id]["active_task"] = task
 
                 # ========== 新 Opus 上传：开始 ==========
-                elif data.get("type") == "audio_start":
+                elif msg_type == "audio_start":
                     turn_id = next_turn_id(client_id)
                     await cancel_active_task(client_id)
                     esp32_sessions[client_id]["incoming_audio"] = {
@@ -514,7 +646,7 @@ async def esp32_endpoint(websocket: WebSocket):
                     print(f"[ESP32] opus audio_start turn_id={turn_id}")
 
                 # ========== 新 Opus 上传：结束 ==========
-                elif data.get("type") == "audio_end":
+                elif msg_type == "audio_end":
                     incoming = esp32_sessions[client_id].pop("incoming_audio", None)
                     if not incoming:
                         print("[ESP32] audio_end without audio_start")
@@ -530,7 +662,7 @@ async def esp32_endpoint(websocket: WebSocket):
                     esp32_sessions[client_id]["active_task"] = task
 
                 # ========== 心跳 ==========
-                elif data.get("type") == "ping":
+                elif msg_type == "ping":
                     await send_json_to_esp32(client_id, {"type": "pong"})
 
             except Exception as e:
@@ -646,7 +778,8 @@ async def health():
         "status": "ok",
         "esp32_connected": bool(esp32_clients),
         "esp32_clients": len(esp32_clients),
-        "pc_agents": len(pc_agents)
+        "pc_agents": len(pc_agents),
+        "version": APP_VERSION,
     }
 
 

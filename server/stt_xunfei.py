@@ -181,3 +181,127 @@ async def recognize(audio_frames: list[bytes]) -> str:
     if error_text:
         print(f"[STT] xfyun failed: {'; '.join(error_text)[:200]}")
     return "".join(result_text)
+
+
+async def recognize_queue(audio_queue) -> str:
+    """
+    从 asyncio.Queue 持续读取 PCM 帧并送讯飞识别。
+
+    调用方把 bytes 帧放进队列，结束时放 None。这样 ESP32 录音期间
+    服务端就可以同步把音频推给讯飞，不必等整段录音结束后再重放。
+    """
+    import asyncio
+    import queue
+    import threading
+
+    loop = asyncio.get_running_loop()
+    sync_queue: queue.Queue = queue.Queue()
+    done_event = asyncio.Event()
+    stop_event = threading.Event()
+    result_text = []
+    error_text = []
+
+    def finish():
+        loop.call_soon_threadsafe(done_event.set)
+
+    async def pump_queue():
+        while True:
+            frame = await audio_queue.get()
+            sync_queue.put(frame)
+            if frame is None:
+                break
+
+    def send_frame(ws, frame: bytes, status: int):
+        data = {
+            "status": status,
+            "format": "audio/L16;rate=16000",
+            "encoding": "raw",
+            "audio": base64.b64encode(frame or b"").decode(),
+        }
+        payload = {"data": data}
+        if status == 0:
+            payload["common"] = {"app_id": XF_APP_ID}
+            payload["business"] = {
+                "language": "zh_cn",
+                "domain": "iat",
+                "accent": "mandarin",
+                "vad_eos": XF_VAD_EOS_MS,
+            }
+        ws.send(json.dumps(payload))
+
+    def on_message(ws, message):
+        data = json.loads(message)
+        if data.get("code") != 0:
+            error_text.append(f"code={data.get('code')} message={data.get('message')}")
+            finish()
+            return
+
+        results = data.get("data", {}).get("result", {}).get("ws", [])
+        for w in results:
+            for cw in w.get("cw", []):
+                result_text.append(cw.get("w", ""))
+
+        if data.get("data", {}).get("status") == 2:
+            finish()
+
+    def on_open(ws):
+        print("[STT] xfyun realtime open")
+        try:
+            first_frame = sync_queue.get(timeout=10)
+            if first_frame is None:
+                finish()
+                return
+
+            send_frame(ws, first_frame, 0)
+            frame_count = 1
+            while not stop_event.is_set():
+                frame = sync_queue.get()
+                if frame is None:
+                    send_frame(ws, b"", 2)
+                    print(f"[STT] xfyun realtime sent frames={frame_count}")
+                    return
+                frame_count += 1
+                send_frame(ws, frame, 1)
+        except Exception as exc:
+            error_text.append(str(exc))
+            finish()
+
+    def on_error(ws, error):
+        error_text.append(str(error))
+        print(f"[STT] xfyun realtime error: {error}")
+        finish()
+
+    def on_close(ws, close_status_code, close_msg):
+        if close_status_code or close_msg:
+            print(f"[STT] xfyun realtime close: code={close_status_code}, msg={close_msg}")
+        finish()
+
+    url = _create_url()
+    ws = websocket.WebSocketApp(
+        url,
+        on_message=on_message,
+        on_open=on_open,
+        on_error=on_error,
+        on_close=on_close,
+    )
+
+    pump_task = asyncio.create_task(pump_queue())
+    thread = threading.Thread(target=ws.run_forever, daemon=True)
+    thread.start()
+
+    try:
+        await asyncio.wait_for(done_event.wait(), timeout=20)
+    finally:
+        stop_event.set()
+        sync_queue.put(None)
+        try:
+            ws.close()
+        except Exception:
+            pass
+        thread.join(timeout=2)
+        if not pump_task.done():
+            pump_task.cancel()
+
+    if error_text:
+        print(f"[STT] xfyun realtime failed: {'; '.join(error_text)[:200]}")
+    return "".join(result_text)

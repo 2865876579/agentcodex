@@ -90,12 +90,12 @@ async def _dispatch_tool(name: str, arguments: dict) -> str:
     return f"工具 {name} 暂未实现"
 
 
-async def chat(user_text: str, history: list[dict] | None = None) -> dict:
+async def chat_stream(user_text: str, history: list[dict] | None = None):
     """
-    与 DeepSeek 对话，支持 Function Calling 多轮工具调用。
+    ★ xiaozhi 风格流式对话，支持 Function Calling。
 
-    返回：{"reply": "回复文字", "pc_command": None}
-    pc_command 字段保留是为了兼容 main.py 现有逻辑，后续工具接入后会用到。
+    跨多轮 LLM 调用连续 yield token，中间插工具执行也不打断流。
+    调用方只需一个 async for，不需要关心工具调用细节。
     """
     if history is None:
         history = []
@@ -104,41 +104,75 @@ async def chat(user_text: str, history: list[dict] | None = None) -> dict:
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
 
-    # Agent 循环：模型可能连续调用多个工具，直到给出最终回复
     for _ in range(MAX_TURNS):
-        kwargs = dict(
+        response = await client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
             max_tokens=1024,
+            tools=TOOLS,
+            stream=True,
         )
-        # 只在有工具时传 tools 参数，避免空列表触发不必要的行为
-        if TOOLS:
-            kwargs["tools"] = TOOLS
 
-        response = await client.chat.completions.create(**kwargs)
-        msg = response.choices[0].message
+        content_parts: list[str] = []
+        tool_calls: dict[int, dict] = {}
 
-        # 模型请求调用工具
-        if msg.tool_calls:
-            history.append(msg)  # 把模型的工具调用意图存入历史
-            for tc in msg.tool_calls:
-                args = json.loads(tc.function.arguments)
-                result = await _dispatch_tool(tc.function.name, args)
-                # 把工具执行结果回传给模型
+        async for chunk in response:
+            delta = chunk.choices[0].delta
+
+            if delta.content:
+                content_parts.append(delta.content)
+                yield delta.content  # ← 立刻流出，不等待
+
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
+                    if tc.id:
+                        tool_calls[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls[idx]["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls[idx]["function"]["arguments"] += tc.function.arguments
+
+        content = "".join(content_parts).strip()
+
+        # 有工具调用 → 执行并继续下一轮
+        if tool_calls:
+            tc_list = []
+            for idx in sorted(tool_calls.keys()):
+                tc = tool_calls[idx]
+                tc_list.append({
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": tc["function"],
+                })
+
+            history.append({
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": tc_list,
+            })
+
+            for tc in tc_list:
+                args = json.loads(tc["function"]["arguments"])
+                result = await _dispatch_tool(tc["function"]["name"], args)
                 history.append({
                     "role": "tool",
-                    "tool_call_id": tc.id,
+                    "tool_call_id": tc["id"],
                     "content": result,
                 })
-            continue  # 让模型根据工具结果继续生成
+            continue  # ← 下一轮 LLM，继续 yield
 
-        # 模型给出最终文字回复
-        reply = (msg.content or "").strip()
+        # 纯文本回复，没有工具调用
+        reply = content
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY:
             history[:] = history[-MAX_HISTORY:]
+        return
 
-        return {"reply": reply, "pc_command": None}
-
-    # 超过最大轮数兜底
-    return {"reply": "抱歉，我刚才有点转不过来，能再说一遍吗？", "pc_command": None}
+    # 超过最大轮数
+    fallback = "抱歉，我刚才有点转不过来，能再说一遍吗？"
+    yield fallback
+    history.append({"role": "assistant", "content": fallback})
