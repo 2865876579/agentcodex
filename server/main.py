@@ -559,8 +559,13 @@ async def esp32_endpoint(websocket: WebSocket):
                 if msg_type == "listen":
                     state = data.get("state")
                     if state == "start":
+                        # ★ AI 回复进行中 → 丢弃这次录音，不创建 STT 任务
+                        active = esp32_sessions[client_id].get("active_task")
+                        if active and not active.done():
+                            esp32_sessions[client_id]["incoming_audio"] = None
+                            continue
+
                         turn_id = next_turn_id(client_id)
-                        # ★ 不 cancel——让 AI 任务自然跑完
                         pcm_queue: asyncio.Queue = asyncio.Queue()
                         esp32_sessions[client_id]["incoming_audio"] = {
                             "turn_id": turn_id,
