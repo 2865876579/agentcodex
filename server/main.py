@@ -121,6 +121,7 @@ async def send_tts_audio_frames_to_esp32(
     *,
     source: str = "assistant",
     turn_id: int | None = None,
+    encoder=None,
 ) -> int:
     websocket = esp32_clients.get(client_id)
     lock = esp32_send_locks.get(client_id)
@@ -128,7 +129,7 @@ async def send_tts_audio_frames_to_esp32(
         return 0
 
     frame_count = 0
-    async for frame in synthesize(text):
+    async for frame in synthesize(text, encoder=encoder):
         if not frame:
             continue
         async with lock:
@@ -286,12 +287,15 @@ async def handle_ai_stream_result(client_id: str, user_text: str, history: list[
     total_frames = 0
     is_first_sentence = True
 
+    # ★ 一个 LLM 回复内共享编码器，避免冷启动首帧 -4/-2
+    import opuslib as _opuslib
+    encoder = _opuslib.Encoder(16000, 1, _opuslib.APPLICATION_VOIP)
+
     try:
         async for delta in chat_stream(user_text, history):
             full_reply += delta
             text_buffer += delta
 
-            # 一个 delta 可能含多句话，while 循环全部处理完
             while True:
                 new_part = text_buffer[processed:]
                 n = _should_flush_tts(new_part, is_first=is_first_sentence)
@@ -310,11 +314,10 @@ async def handle_ai_stream_result(client_id: str, user_text: str, history: list[
                         client_id, "sentence_start", turn_id=turn_id, text=sentence
                     )
                     total_frames += await send_tts_audio_frames_to_esp32(
-                        client_id, sentence, turn_id=turn_id
+                        client_id, sentence, turn_id=turn_id, encoder=encoder
                     )
                 is_first_sentence = False
 
-        # 收尾：发送剩余未处理文本
         remaining = text_buffer[processed:].strip()
         if remaining:
             if not started_tts:
@@ -324,7 +327,7 @@ async def handle_ai_stream_result(client_id: str, user_text: str, history: list[
                     client_id, "sentence_start", turn_id=turn_id, text=remaining
                 )
                 total_frames += await send_tts_audio_frames_to_esp32(
-                    client_id, remaining, turn_id=turn_id
+                    client_id, remaining, turn_id=turn_id, encoder=encoder
                 )
     finally:
         if started_tts:

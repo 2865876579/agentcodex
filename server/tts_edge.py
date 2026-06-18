@@ -34,21 +34,23 @@ FRAME_DURATION_MS = 60
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 960 samples
 
 
-async def synthesize(text: str) -> AsyncIterator[bytes]:
+async def synthesize(text: str, encoder=None) -> AsyncIterator[bytes]:
     """
-    文字转语音流（Opus 编码）
+    文字转语音流（Opus 编码）。encoder 为 None 时内部创建，传入则复用。
 
     产出：Opus 编码音频帧（每帧 60ms，约 80-120 字节）
     """
-    # 过滤 emoji，TTS 不认识会读成乱码
     text = _EMOJI_RE.sub("", text).strip()
     if not text:
         return
 
+    _enc = encoder
+    if _enc is None:
+        _enc = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
+
     import time as _time
     _t0 = _time.monotonic()
     try:
-        # 1. Edge TTS → MP3（纯文本 + 配置语速/音量，不用 SSML 避免解析异常）
         print(f"[TTS] Step1: Edge TTS 开始, voice={TTS_VOICE}, rate={TTS_RATE}, volume={TTS_VOLUME}")
         communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE, volume=TTS_VOLUME)
         mp3_chunks: list[bytes] = []
@@ -62,7 +64,6 @@ async def synthesize(text: str) -> AsyncIterator[bytes]:
             print("[TTS] Step1: Edge TTS 返回空音频!")
             return
 
-        # 2. MP3 → PCM（16kHz 16bit mono）
         print(f"[TTS] Step2: MP3→PCM 解码开始, mp3_size={sum(len(c) for c in mp3_chunks)}")
         mp3_data = b"".join(mp3_chunks)
         decoded = miniaudio.decode(
@@ -71,39 +72,26 @@ async def synthesize(text: str) -> AsyncIterator[bytes]:
             nchannels=CHANNELS,
             sample_rate=SAMPLE_RATE,
         )
-        pcm_bytes = bytes(decoded.samples)
+        pcm = bytes(decoded.samples)
         _t2 = _time.monotonic()
-        print(f"[TTS] Step2: MP3→PCM 完成, pcm_samples={len(pcm_bytes)//2},耗时={_t2-_t1:.1f}s")
+        print(f"[TTS] Step2: MP3→PCM 完成, pcm_samples={len(pcm)//2},耗时={_t2-_t1:.1f}s")
 
-        # 3. PCM → Opus（60ms 帧）
-        print(f"[TTS] Step3: Opus 编码开始")
-        encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
-
-        total_samples = len(pcm_bytes) // 2  # int16 samples
+        # ★ PCM → Opus 帧。统一处理：不足 60ms 的尾帧补零
+        total_samples = len(pcm) // 2
         frame_count = 0
-        offset = 0
-        while offset < total_samples:
-            remaining = total_samples - offset
-            if remaining >= FRAME_SAMPLES:
-                # 完整 60ms 帧
-                frame_samples = FRAME_SAMPLES
-                frame_bytes = FRAME_SAMPLES * 2
-            else:
-                # 最后一帧不足 60ms，补零
-                frame_samples = remaining
-                frame_bytes = remaining * 2
-                pcm_bytes += b"\x00" * ((FRAME_SAMPLES * 2) - frame_bytes)
-
-            raw_frame = pcm_bytes[offset * 2 : offset * 2 + FRAME_SAMPLES * 2]
-            # 如果帧短于标准长度（最后帧），padding 到 960 samples
+        pos = 0
+        while pos < total_samples:
+            end = pos + FRAME_SAMPLES
+            if end > total_samples:
+                end = total_samples
+            raw_frame = pcm[pos * 2 : end * 2]
             if len(raw_frame) < FRAME_SAMPLES * 2:
-                raw_frame = raw_frame + b"\x00" * (FRAME_SAMPLES * 2 - len(raw_frame))
+                raw_frame = raw_frame.ljust(FRAME_SAMPLES * 2, b"\x00")
 
-            opus_frame = encoder.encode(raw_frame, FRAME_SAMPLES)
+            opus_frame = _enc.encode(raw_frame, FRAME_SAMPLES)
             frame_count += 1
             yield opus_frame
-
-            offset += frame_samples
+            pos = end
 
         _t3 = _time.monotonic()
         print(f"[TTS] Step3: Opus 编码完成, frames={frame_count},耗时={_t3-_t2:.1f}s,总耗时={_t3-_t0:.1f}s")
