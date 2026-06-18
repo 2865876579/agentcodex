@@ -37,7 +37,7 @@ from tts_edge import synthesize
 from web_search import direct_answer_from_results, format_search_results, search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
 app = FastAPI(title="Smart Pillow Cloud Server")
-APP_VERSION = "continuous_dialog_v3_opus_upload"
+APP_VERSION = "continuous_dialog_v4_binary_tts"
 
 WAKE_TRIGGER_TEXT = "__wake__"
 WAKE_REPLY_TEXT = "我在，你说。"
@@ -143,6 +143,13 @@ async def send_tts_stream_to_esp32(
             await websocket.send_text(json.dumps(payload, ensure_ascii=False))
         return True
 
+    async def _send_binary_frame(frame: bytes) -> bool:
+        async with lock:
+            if source == "assistant" and not is_current_turn(client_id, turn_id):
+                return False
+            await websocket.send_bytes(frame)
+        return True
+
     synth_task = asyncio.create_task(_synth_to_queue())
     seq = 0
 
@@ -162,14 +169,7 @@ async def send_tts_stream_to_esp32(
                 break
 
             seq += 1
-            if not await _send_payload({
-                "type": "tts_audio_chunk",
-                "codec": "opus",
-                "seq": seq,
-                "source": source,
-                "turn_id": turn_id,
-                "audio": base64.b64encode(frame).decode()
-            }):
+            if not await _send_binary_frame(frame):
                 return False
     finally:
         if not synth_task.done():
@@ -188,6 +188,7 @@ async def send_tts_stream_to_esp32(
         "chunks": seq,
         "source": source,
         "turn_id": turn_id,
+        "transport": "binary",
         "dialog_end": end_dialog
     }):
         return False
