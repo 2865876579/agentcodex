@@ -34,7 +34,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from config import SERVER_HOST, SERVER_PORT
 from stt_xunfei import recognize, recognize_queue
 from llm_deepseek import chat_stream
-from tts_edge import synthesize
+from tts_volc import synthesize
 from web_search import direct_answer_from_results, format_search_results, search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
 app = FastAPI(title="Smart Pillow Cloud Server")

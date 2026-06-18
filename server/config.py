@@ -49,6 +49,15 @@ TTS_STYLE = os.getenv("TTS_STYLE", "gentle")
 # 风格强度 0.0~1.0
 TTS_STYLE_DEGREE = float(os.getenv("TTS_STYLE_DEGREE", "1.2"))
 
+# ==================== 火山引擎 TTS 配置 ====================
+# 豆包语音合成模型 2.0，字符版
+# 接入地址：https://console.volcengine.com/speech/service/tts
+# 密钥管理：控制台右上角头像 → 访问控制 → 密钥管理
+VOLC_APP_ID = os.getenv("VOLC_APP_ID", "3432755400")
+VOLC_API_KEY = os.getenv("VOLC_API_KEY", "0125ffe2-58de-4004-a3aa-8b39ae0fc3da")
+VOLC_VOICE_TYPE = os.getenv("VOLC_VOICE_TYPE", "zh_female_vv_uranus_bigtts")
+# 可选: VOLC_TTS_ENDPOINT 自定义 API 地址
+
 # ==================== 服务配置 ====================
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")  # 监听地址，0.0.0.0 表示所有网卡
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))  # 监听端口1
