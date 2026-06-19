@@ -68,6 +68,13 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Shanghai")
 # 天气、本地新闻等无需用户每次说城市名
 LOCATION = os.getenv("LOCATION", "重庆")
 
+# ==================== 邮箱配置（QQ邮箱 IMAP）====================
+# 用于服务端后台拉取邮件，不需要 PC Agent
+# 授权码获取：QQ邮箱网页版 → 设置 → 账户 → POP3/IMAP → 开启 → 生成
+EMAIL_HOST = os.getenv("EMAIL_HOST", "imap.qq.com")
+EMAIL_USER = os.getenv("EMAIL_USER", "")
+EMAIL_PASS = os.getenv("EMAIL_PASS", "")
+
 # ==================== 服务配置 ====================
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")  # 监听地址，0.0.0.0 表示所有网卡
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))  # 监听端口1

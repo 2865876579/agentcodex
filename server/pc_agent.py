@@ -117,6 +117,101 @@ async def handle_command(command: dict) -> str:
         except Exception as e:
             return f"读取文件失败: {e}"
 
+    elif action == "desktop_write":
+        # 在用户桌面创建/覆盖文件
+        filename = params.get("filename", "summary.txt")
+        content = params.get("content", "")
+        if not content:
+            return "缺少文件内容"
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        path = os.path.join(desktop, filename)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"已写入桌面文件：{filename}（{len(content)}字）"
+        except Exception as e:
+            return f"写入桌面文件失败: {e}"
+
+    elif action == "clipboard_get":
+        # 读取 Windows 剪贴板文本
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+                capture_output=True, text=True, timeout=5
+            )
+            text = r.stdout.strip()
+            return text if text else "剪贴板为空"
+        except Exception as e:
+            return f"读取剪贴板失败: {e}"
+
+    elif action == "clipboard_set":
+        # 写入 Windows 剪贴板
+        import subprocess
+        text = params.get("text", "")
+        if not text:
+            return "缺少要写入剪贴板的文本"
+        try:
+            # 用 PowerShell 安全写入（避免命令注入）
+            escaped = text.replace("'", "''")
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Set-Clipboard -Value '{escaped}'"],
+                capture_output=True, timeout=5
+            )
+            return f"已写入剪贴板（{len(text)}字）"
+        except Exception as e:
+            return f"写入剪贴板失败: {e}"
+
+    elif action == "screenshot":
+        # 截屏保存到桌面
+        import subprocess
+        from datetime import datetime
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(desktop, f"screenshot_{ts}.png")
+        try:
+            subprocess.run([
+                "powershell", "-NoProfile", "-Command",
+                f"Add-Type -AssemblyName System.Windows.Forms; "
+                f"[System.Windows.Forms.Screen]::PrimaryScreen().Bounds | "
+                f"ForEach-Object {{ $bmp = New-Object System.Drawing.Bitmap "
+                f"$_.Width,$_.Height; $g = [System.Drawing.Graphics]::FromImage($bmp); "
+                f"$g.CopyFromScreen($_.X,$_.Y,0,0,$_.Size); "
+                f"$bmp.Save('{path}'); $g.Dispose(); $bmp.Dispose() }}"
+            ], capture_output=True, timeout=10)
+            return f"截图已保存到桌面：screenshot_{ts}.png"
+        except Exception as e:
+            return f"截图失败: {e}"
+
+    elif action == "run_app":
+        # 启动应用
+        import subprocess
+        app = params.get("app", "")
+        if not app:
+            return "缺少应用名称或路径"
+        try:
+            subprocess.Popen(app, shell=True)
+            return f"已启动：{app}"
+        except Exception as e:
+            return f"启动失败: {e}"
+
+    elif action == "run_cmd":
+        # 执行命令并返回输出
+        import subprocess
+        cmd = params.get("cmd", "")
+        if not cmd:
+            return "缺少要执行的命令"
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+            out = r.stdout.strip() or r.stderr.strip()
+            if not out:
+                return f"命令执行完毕，无输出（返回码 {r.returncode}）"
+            preview = out[:800]
+            return preview if len(out) <= 800 else preview + "\n...(输出已截断)"
+        except Exception as e:
+            return f"执行命令失败: {e}"
+
     else:
         return f"不支持的命令: {action}"
 

@@ -86,12 +86,15 @@ def _is_gold_query(query: str) -> bool:
 def _is_news_query(query: str) -> bool:
     if _contains_any(query, NEWS_KEYWORDS):
         return True
-    has_scope_word = any(word in query for word in NEWS_DOMESTIC_WORDS + NEWS_WORLD_WORDS)
-    has_hard_news_word = any(word in query for word in ("局势", "冲突", "战争", "选举", "制裁", "外交"))
-    if has_scope_word and has_hard_news_word:
+    # 含硬新闻词（局势/冲突/战争等）大概率是新闻查询
+    hard_words = ("局势", "冲突", "战争", "选举", "制裁", "外交", "政变", "抗议", "暴乱", "恐怖", "袭击")
+    if any(word in query for word in hard_words):
         return True
+    has_scope_word = any(word in query for word in NEWS_DOMESTIC_WORDS + NEWS_WORLD_WORDS)
+    if has_scope_word:
+        return True  # "国际新闻""国内大事" 都是新闻
     has_time_word = any(word in query for word in ("今天", "今日", "现在", "最新", "最近"))
-    has_news_word = any(word in query for word in ("发生", "事件", "消息", "要闻", "头条", "热点", "局势"))
+    has_news_word = any(word in query for word in ("发生", "事件", "消息", "要闻", "头条", "热点"))
     return has_time_word and has_news_word
 
 
@@ -543,54 +546,5 @@ def format_search_results(query: str, results: list[SearchResult]) -> str:
 
 
 def direct_answer_from_results(query: str, results: list[SearchResult]) -> str | None:
-    """Return a deterministic spoken answer for structured data sources."""
-    if not results:
-        return None
-
-    if _is_gold_query(query):
-        au9999 = next((item for item in results if "Au99.99" in item.title), None)
-        autd = next((item for item in results if "Au(T+D)" in item.title), None)
-        alipay = "支付宝" in query
-
-        parts: list[str] = []
-        if au9999:
-            parts.append(f"上海金 Au99.99：{au9999.snippet.rstrip('。')}")
-        if autd:
-            parts.append(f"黄金 T+D：{autd.snippet.rstrip('。')}")
-        if not parts:
-            return None
-
-        answer = "；".join(parts)
-        if alipay:
-            answer += "。支付宝里的金价还会受具体产品和买卖差价影响，最终以支付宝 App 页面为准。"
-        else:
-            answer += "。这是交易所行情，不等同于金店零售价。"
-        return answer
-
-    weather = next((item for item in results if item.title.endswith("当前天气")), None)
-    if weather:
-        city = weather.title.removesuffix("当前天气")
-        return f"{city}现在{weather.snippet}。"
-
-    if _is_news_query(query):
-        news_items = [
-            item for item in results
-            if item.title.startswith(("国内：", "国际：", "滚动："))
-        ]
-        if not news_items:
-            return None
-
-        parts: list[str] = []
-        for item in news_items[:4]:
-            scope = ""
-            title = item.title
-            match = re.match(r"^(国内|国际|滚动)[：:](.*)$", item.title)
-            if match:
-                scope = match.group(1)
-                title = match.group(2).strip()
-            prefix = f"{scope}，" if scope in ("国内", "国际") else ""
-            parts.append(prefix + _limit_text(title, 28))
-
-        return "我查到几条最新消息：" + "；".join(parts) + "。"
-
+    """不再硬编码解析，始终返回 None，让 LLM 自己读 format_search_results 输出做总结。"""
     return None

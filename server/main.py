@@ -33,21 +33,20 @@ import urllib.parse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from config import SERVER_HOST, SERVER_PORT
 from stt_xunfei import recognize, recognize_queue
-from llm_deepseek import chat_stream
+from llm_deepseek import chat_stream, set_pc_command_callback
 from tts_volc import synthesize
-from web_search import direct_answer_from_results, format_search_results, search_web  # 搜索工具，供后续 function calling 工具接入时使用
+from web_search import search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
 app = FastAPI(title="Smart Pillow Cloud Server")
 APP_VERSION = "xiaozhi_realtime_v5"
 
 WAKE_TRIGGER_TEXT = "__wake__"
 WAKE_REPLY_TEXT = "我在，你说。"
-EXIT_REPLY_TEXT = "好的，再见小智。"
+EXIT_REPLY_TEXT = "好的，再见小安。"
 EXIT_PHRASES = (
-    "再见小智",
-    "再见小知",
-    "小智再见",
-    "拜拜小智",
+    "再见小安",
+    "小安再见",
+    "拜拜小安",
     "退出对话",
     "结束对话",
 )
@@ -66,7 +65,35 @@ esp32_clients: dict[str, WebSocket] = {}
 esp32_send_locks: dict[str, asyncio.Lock] = {}
 esp32_sessions: dict[str, dict] = {}
 pc_command_contexts: dict[str, dict] = {}
+_pc_command_futures: dict[str, asyncio.Future] = {}  # LLM → PC Agent 往返
 last_active_esp32_id: str | None = None
+
+
+async def _pc_command_cb(action: str, params: dict, client_id: str, turn_id: int) -> str:
+    """LLM 调 pc_command 工具时的回调：发命令到 PC Agent 并等结果。"""
+    if not pc_agents:
+        return "电脑助手未连接，请先在电脑上运行 pc_agent.py"
+
+    command_id = f"{client_id}:{turn_id}:{int(time.time() * 1000)}"
+    future: asyncio.Future = asyncio.get_event_loop().create_future()
+    _pc_command_futures[command_id] = future
+
+    sent = await send_pc_command({"action": action, "params": params}, client_id, turn_id)
+    if not sent:
+        _pc_command_futures.pop(command_id, None)
+        return "发送命令失败，电脑可能断开了"
+
+    try:
+        result = await asyncio.wait_for(future, timeout=20.0)
+        return result
+    except asyncio.TimeoutError:
+        return "电脑操作超时，请确认 PC Agent 还在运行"
+    finally:
+        _pc_command_futures.pop(command_id, None)
+
+
+# 注册回调：LLM 调 pc_command 工具时，通过此回调发命令到 PC Agent
+set_pc_command_callback(_pc_command_cb)
 
 
 def is_exit_phrase(text: str) -> bool:
@@ -147,7 +174,7 @@ async def send_tts_stream_to_esp32(
     end_dialog: bool = False,
 ) -> bool:
     """
-    小智协议 TTS：
+    小安协议 TTS：
       - {"type":"tts","state":"start"}
       - binary Opus frames
       - {"type":"tts","state":"stop"}
@@ -292,7 +319,8 @@ async def handle_ai_stream_result(client_id: str, user_text: str, history: list[
     encoder = _opuslib.Encoder(16000, 1, _opuslib.APPLICATION_VOIP)
 
     try:
-        async for delta in chat_stream(user_text, history):
+        async for delta in chat_stream(user_text, history,
+                                        client_id=client_id, turn_id=turn_id):
             full_reply += delta
             text_buffer += delta
 
@@ -734,6 +762,13 @@ async def pc_agent_endpoint(websocket: WebSocket):
                 command_id = data.get("command_id")
                 result_turn_id = data.get("turn_id")
                 print(f"[PC Agent] 执行结果: {result_text}")
+
+                # ★ LLM 发起的 PC 命令：resolve future，让 LLM 拿到结果后组织语言播报
+                if command_id:
+                    future = _pc_command_futures.pop(command_id, None)
+                    if future and not future.done():
+                        future.set_result(result_text)
+                        continue  # LLM 接管播报，不重复走老逻辑
 
                 context = pc_command_contexts.pop(command_id, None) if command_id else None
                 target_id = pick_esp32_client(data.get("client_id") or (context or {}).get("client_id"))
