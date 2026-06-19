@@ -268,7 +268,7 @@ def _extract_weather_location(query: str) -> str | None:
         return None
 
     location = query
-    for word in ("天气预报", "天气", "气温", "今天", "今日", "现在", "最新", "查询", "查一下", "怎么样", "如何", "的"):
+    for word in ("天气预报", "天气", "气温", "今天", "今日", "明天", "后天", "昨天", "现在", "最新", "查询", "查一下", "怎么样", "如何", "的"):
         location = location.replace(word, " ")
     location = re.sub(r"[，。！？、,.!?]", " ", location)
     location = re.sub(r"\s+", " ", location).strip()
@@ -299,10 +299,16 @@ def _weather_search(query: str) -> list[SearchResult]:
     if weather_text:
         parts.insert(0, weather_text)
 
-    forecast = data.get("weather", [{}])[0]
-    if forecast:
+    forecast_today = data.get("weather", [{}])[0]
+    if forecast_today:
         parts.append(
-            f"今日{forecast.get('mintempC', '?')}到{forecast.get('maxtempC', '?')}℃"
+            f"今日{forecast_today.get('mintempC', '?')}到{forecast_today.get('maxtempC', '?')}℃"
+        )
+    # 明天预报——LLM 查明天天气时第一次就能拿到答案
+    if len(data.get("weather", [])) > 1:
+        forecast_tomorrow = data["weather"][1]
+        parts.append(
+            f"明天{forecast_tomorrow.get('mintempC', '?')}到{forecast_tomorrow.get('maxtempC', '?')}℃"
         )
 
     return [SearchResult(

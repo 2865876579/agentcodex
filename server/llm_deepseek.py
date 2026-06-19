@@ -77,12 +77,15 @@ async def _dispatch_tool(name: str, arguments: dict) -> str:
     """
     if name == "web_search":
         query = arguments.get("query", "")
+        print(f"[Tool] web_search query={query!r}")
         results = await search_web(query)
         if not results:
+            print(f"[Tool] web_search 无结果")
             return "没有搜到可靠结果。"
-        # 优先用结构化直接答案（天气/金价/新闻），否则返回摘要文本供模型总结
         direct = direct_answer_from_results(query, results)
-        return direct if direct else format_search_results(query, results)
+        answer = direct if direct else format_search_results(query, results)
+        print(f"[Tool] web_search result_len={len(answer)} direct={direct is not None}")
+        return answer
 
     # 后续在此处添加更多工具，例如：
     # elif name == "pc_command":
