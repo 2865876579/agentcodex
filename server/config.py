@@ -58,6 +58,16 @@ VOLC_API_KEY = os.getenv("VOLC_API_KEY", "0125ffe2-58de-4004-a3aa-8b39ae0fc3da")
 VOLC_VOICE_TYPE = os.getenv("VOLC_VOICE_TYPE", "zh_female_vv_uranus_bigtts")
 # 可选: VOLC_TTS_ENDPOINT 自定义 API 地址
 
+# ==================== 时区配置 ====================
+# 服务端时区，用于向 LLM 注入当前时间、时区转换等时间功能
+# 常用值：Asia/Shanghai（北京）、America/New_York（纽约）、Europe/London（伦敦）
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Shanghai")
+
+# ==================== 位置配置 ====================
+# 设备所在地，注入到 LLM 对话中，让模型知道用户在哪
+# 天气、本地新闻等无需用户每次说城市名
+LOCATION = os.getenv("LOCATION", "重庆")
+
 # ==================== 服务配置 ====================
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")  # 监听地址，0.0.0.0 表示所有网卡
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))  # 监听端口1
