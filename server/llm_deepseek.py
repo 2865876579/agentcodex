@@ -309,7 +309,7 @@ TOOLS = [
                         "description": "tilt=充气, recover=泄气, stop=急停"
                     },
                     "duration_sec": {
-                        "type": "integer", "minimum": 1, "maximum": 5,
+                        "type": "integer", "minimum": 1, "maximum": 7,
                         "description": "充气秒数，1=微调 5=最大"
                     },
                 },
