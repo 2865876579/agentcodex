@@ -13,7 +13,7 @@ import imaplib
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
-from email.header import decode_header
+from email.header import decode_header, make_header
 
 from config import EMAIL_HOST, EMAIL_USER, EMAIL_PASS
 
@@ -31,19 +31,13 @@ def _decode_mime(text: str | bytes | None) -> str:
     """解码 MIME 编码的邮件头（=?UTF-8?B?...?= 等）。"""
     if not text:
         return ""
-    if isinstance(text, str):
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    try:
+        from email.header import make_header
+        return str(make_header(decode_header(text)))
+    except Exception:
         return text
-    parts = decode_header(text)
-    result: list[str] = []
-    for payload, charset in parts:
-        if isinstance(payload, bytes):
-            try:
-                result.append(payload.decode(charset or "utf-8", errors="replace"))
-            except Exception:
-                result.append(payload.decode("utf-8", errors="replace"))
-        else:
-            result.append(str(payload))
-    return "".join(result)
 
 
 def _extract_body(msg: email.message.Message) -> str:
@@ -86,12 +80,16 @@ def _preview(text: str, max_chars: int = 200) -> str:
     return text[:max_chars].rstrip() + "..."
 
 
-def check_emails_today(max_count: int = 10) -> list[EmailSummary]:
+def check_emails_by_date(target_date: date | None = None, max_count: int = 10) -> list[EmailSummary]:
     """
-    拉取今天收到的邮件摘要。
+    拉取指定日期的邮件摘要。
 
-    返回 EmailSummary 列表，失败抛异常（调用方处理）。
+    target_date: None=今天, date(2026,6,19)=指定日
+    max_count: 最多返回 N 封
     """
+    if target_date is None:
+        target_date = date.today()
+
     if not EMAIL_USER or not EMAIL_PASS:
         raise RuntimeError("邮箱未配置，请在 .env 中设置 EMAIL_USER 和 EMAIL_PASS")
 
@@ -102,20 +100,23 @@ def check_emails_today(max_count: int = 10) -> list[EmailSummary]:
     try:
         imap.login(EMAIL_USER, EMAIL_PASS)
 
-        # 选择收件箱（163/QQ 都叫 INBOX）
+        # ★ 163 要求客户端自报身份，否则 select 被拒
+        tag = imap._new_tag()
+        imap.send(tag + b' ID ("name" "SmartPillow" "version" "1.0" "os" "linux")\r\n')
+        imap._get_tagged_response(tag, "ID")
+
+        # 选择收件箱
         status, _ = imap.select("INBOX", readonly=True)
         if status != "OK":
-            # 163 有时需要重新登录后再 select
             imap.select("INBOX", readonly=True)
 
-        # 搜索今天的邮件（163 不支持 SINCE，改用 ALL + 手动过滤）
+        # 搜索全部，客户端过滤日期
         status, msg_ids = imap.search(None, "ALL")
         if status != "OK" or not msg_ids[0]:
             return results
 
         ids = msg_ids[0].split()
-        # 取最近 N 封（倒序），fetch 时再过滤日期
-        ids = ids[-max_count * 3:]  # 多取一些，客户端过滤日期
+        ids = ids[-max_count * 3:]
 
         for msg_id in reversed(ids):
             status, data = imap.fetch(msg_id, "(RFC822)")
@@ -125,22 +126,18 @@ def check_emails_today(max_count: int = 10) -> list[EmailSummary]:
             raw = data[0][1]
             msg = email.message_from_bytes(raw)
 
-            # 发件人
             sender = _decode_mime(msg.get("From", ""))
-
-            # 主题
             subject = _decode_mime(msg.get("Subject", ""))
 
-            # 日期 + 只保留今天的
+            # ★ 日期过滤
             date_str = msg.get("Date", "")
             try:
-                # 解析邮件 Date 头，过滤非今天邮件
                 from email.utils import parsedate_to_datetime
                 mail_dt = parsedate_to_datetime(date_str)
-                if mail_dt.date() != today:
+                if mail_dt.date() != target_date:
                     continue
             except Exception:
-                pass  # 解析失败不跳过，可能仍是今天的
+                continue
 
             # 附件
             has_attachment = False
@@ -174,12 +171,44 @@ def check_emails_today(max_count: int = 10) -> list[EmailSummary]:
     return results
 
 
-def format_email_summary(emails: list[EmailSummary]) -> str:
+def parse_date_str(text: str) -> date | None:
+    """
+    把 LLM 传来的日期字符串转为 date 对象。
+    支持: "today"/"今天", "yesterday"/"昨天", "2026-06-19"
+    """
+    text = text.strip().lower()
+    if text in ("today", "今天", ""):
+        return date.today()
+    if text in ("yesterday", "昨天"):
+        return date.today() - timedelta(days=1)
+    # YYYY-MM-DD
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        pass
+    # YYYY/MM/DD
+    try:
+        return datetime.strptime(text, "%Y/%m/%d").date()
+    except ValueError:
+        pass
+    return None
+
+
+def format_email_summary(emails: list[EmailSummary], target_date: date | None = None) -> str:
     """把邮件摘要列表格式化为给 LLM 的自然语言文本。"""
     if not emails:
-        return "今天没有新邮件。"
+        label = f"{target_date}没有新邮件。" if target_date else "没有新邮件。"
+        return label
 
-    lines = [f"今天共 {len(emails)} 封邮件："]
+    if target_date is None:
+        label = "今天"
+    elif target_date == date.today():
+        label = "今天"
+    elif target_date == date.today() - timedelta(days=1):
+        label = "昨天"
+    else:
+        label = str(target_date)
+    lines = [f"{label}共 {len(emails)} 封邮件："]
     for i, em in enumerate(emails, 1):
         sender_short = em.sender.split("<")[0].strip().rstrip()
         att = " [有附件]" if em.has_attachment else ""

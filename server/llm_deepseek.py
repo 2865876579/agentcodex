@@ -22,7 +22,7 @@ except ImportError:
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, TIMEZONE, LOCATION
 from web_search import search_web  # 金价/天气/新闻结构化搜索，保留备用
-from email_checker import check_emails_today, format_email_summary
+from email_checker import check_emails_by_date, format_email_summary, parse_date_str
 
 # ── PC 命令回调（由 main.py 注册）─────────────────────────
 # 当 LLM 调 pc_command 工具时，通过此回调将命令发给 PC Agent
@@ -241,10 +241,19 @@ TOOLS = [
         "function": {
             "name": "check_emails",
             "description": (
-                "后台检查今天收到的邮件。适用场景：用户问'有邮件吗''帮我看看邮箱'"
-                "'今天谁给我发邮件了'等。不需要用户提供账号密码，服务端已配置。"
+                "检查指定日期的邮件。适用场景：'今天有邮件吗''昨天的邮件整理了没'等。"
+                "date 参数传 'today'/'今天'/'yesterday'/'昨天' 或具体日期如 '2026-06-19'。"
+                "不传则默认今天。不需要用户提供账号密码，服务端已配置。"
             ),
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "查询日期：today/今天/yesterday/昨天/YYYY-MM-DD，不传默认今天"
+                    }
+                },
+            },
         },
     },
     {
@@ -298,11 +307,15 @@ async def _dispatch_tool(name: str, arguments: dict, *, client_id: str = "", tur
         return result
 
     elif name == "check_emails":
-        # 服务端 IMAP 拉取邮件摘要
-        print("[Tool] check_emails")
+        # 服务端 IMAP 拉取邮件摘要，支持指定日期
+        date_str = arguments.get("date", "today")
+        target = parse_date_str(date_str)
+        if target is None:
+            return f"无法解析日期'{date_str}'，请用 today/yesterday/YYYY-MM-DD 格式"
+        print(f"[Tool] check_emails target={target}")
         try:
-            emails = check_emails_today()
-            result = format_email_summary(emails)
+            emails = check_emails_by_date(target)
+            result = format_email_summary(emails, target)
             print(f"[Tool] check_emails count={len(emails)}")
             return result
         except Exception as e:
