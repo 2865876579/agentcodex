@@ -21,7 +21,7 @@ except ImportError:
 
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, TIMEZONE, LOCATION
-from web_search import search_web  # 金价/天气/新闻结构化搜索，保留备用
+from web_search import search_web, format_search_results
 from email_checker import check_emails_by_date, format_email_summary, parse_date_str
 
 # ── PC 命令回调（由 main.py 注册）─────────────────────────
@@ -200,6 +200,20 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "web_search",
+            "description": "联网搜索实时信息。适用于天气/新闻/金价等，不确定的信息必须搜。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_current_time",
             "description": (
                 "获取时间相关信息。适用场景："
@@ -329,7 +343,17 @@ async def _dispatch_tool(name: str, arguments: dict, *, client_id: str = "", tur
 
     client_id / turn_id 用于 pc_command 路由到正确的 ESP32 设备。
     """
-    if name == "get_current_time":
+    if name == "web_search":
+        query = arguments.get("query", "")
+        print(f"[Tool] web_search query={query!r}")
+        results = await search_web(query)
+        if not results:
+            return "没有搜到结果，请直接告诉用户。"
+        answer = format_search_results(query, results)
+        print(f"[Tool] web_search result_len={len(answer)}")
+        return answer
+
+    elif name == "get_current_time":
         action = arguments.get("action", "now")
         target = arguments.get("target", "")
         tz = arguments.get("timezone", "")
