@@ -324,7 +324,7 @@ TOOLS = [
                     },
                     "duration_sec": {
                         "type": "integer", "minimum": 1, "maximum": 7,
-                        "description": "充气秒数，1=微调 5=最大"
+                        "description": "充气秒数，用户第一次说低/高就直接拉满7秒，说'再调'才1-3秒微调"
                     },
                 },
                 "required": ["action"],
