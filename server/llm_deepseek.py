@@ -32,6 +32,13 @@ def set_pc_command_callback(cb):
     global _pc_command_cb
     _pc_command_cb = cb
 
+# ── 枕头控制回调（由 main.py 注册）─────────────────────
+_pillow_cb = None  # async def cb(action: str, level: int, duration_sec: int, client_id: str, turn_id: int) -> str
+
+def set_pillow_callback(cb):
+    global _pillow_cb
+    _pillow_cb = cb
+
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 # ── 系统提示词 ──────────────────────────────────────────────
@@ -286,9 +293,33 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "pillow_control",
+            "description": (
+                "控制智能枕头硬件（气泵+泄气阀）。用户说枕头太低/太高/不舒服/"
+                "想翻身时调用。tilt=充气侧倾, recover=泄气恢复, stop=急停"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string", "enum": ["tilt", "recover", "stop"],
+                        "description": "tilt=充气, recover=泄气, stop=急停"
+                    },
+                    "duration_sec": {
+                        "type": "integer", "minimum": 1, "maximum": 5,
+                        "description": "充气秒数，1=微调 5=最大"
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
 ]
 
-MAX_HISTORY = 20   # 保留最近 N 条消息，避免 token 超限
+MAX_HISTORY = 40   # 保留最近 N 条消息，多工具调用需要更大窗口
 MAX_TURNS = 5      # 单次请求最多允许模型连续调用工具的轮数，防止死循环
 
 
@@ -342,6 +373,20 @@ async def _dispatch_tool(name: str, arguments: dict, *, client_id: str = "", tur
         except Exception as e:
             print(f"[Tool] pc_command error: {e}")
             return f"执行失败：{e}"
+
+    elif name == "pillow_control":
+        # 枕头硬件控制：通过回调发 WebSocket 命令到 ESP32
+        action = arguments.get("action", "")
+        duration = arguments.get("duration_sec", 3)
+        print(f"[Tool] pillow_control action={action!r} duration={duration}")
+        if not _pillow_cb:
+            return "枕头控制未连接，请确认 ESP32 在线。"
+        try:
+            result = await _pillow_cb(action, duration, client_id, turn_id)
+            return result
+        except Exception as e:
+            print(f"[Tool] pillow_control error: {e}")
+            return f"枕头控制失败：{e}"
 
     return f"工具 {name} 暂未实现"
 
@@ -399,8 +444,8 @@ async def chat_stream(user_text: str, history: list[dict] | None = None,
                     if tc.id:
                         tool_calls[idx]["id"] = tc.id
                     if tc.function:
-                        if tc.function.name:
-                            tool_calls[idx]["function"]["name"] += tc.function.name
+                        if tc.function.name and not tool_calls[idx]["function"]["name"]:
+                            tool_calls[idx]["function"]["name"] = tc.function.name
                         if tc.function.arguments:
                             tool_calls[idx]["function"]["arguments"] += tc.function.arguments
 

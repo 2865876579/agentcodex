@@ -33,7 +33,7 @@ import urllib.parse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from config import SERVER_HOST, SERVER_PORT
 from stt_xunfei import recognize, recognize_queue
-from llm_deepseek import chat_stream, set_pc_command_callback
+from llm_deepseek import chat_stream, set_pc_command_callback, set_pillow_callback
 from tts_volc import synthesize
 from web_search import search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
@@ -92,8 +92,18 @@ async def _pc_command_cb(action: str, params: dict, client_id: str, turn_id: int
         _pc_command_futures.pop(command_id, None)
 
 
-# 注册回调：LLM 调 pc_command 工具时，通过此回调发命令到 PC Agent
+async def _pillow_cb(action: str, duration_sec: int, client_id: str, turn_id: int) -> str:
+    """LLM 调 pillow_control 工具时：发 WebSocket 命令到 ESP32。"""
+    target = pick_esp32_client(client_id)
+    if not target:
+        return "ESP32 未连接"
+    payload = {"type": "pillow_cmd", "action": action, "duration_sec": duration_sec}
+    ok = await send_json_to_esp32(target, payload)
+    return "已发送枕头指令" if ok else "发送失败"
+
+# 注册回调
 set_pc_command_callback(_pc_command_cb)
+set_pillow_callback(_pillow_cb)
 
 
 def is_exit_phrase(text: str) -> bool:
