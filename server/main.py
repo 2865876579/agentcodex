@@ -68,6 +68,12 @@ pc_command_contexts: dict[str, dict] = {}
 _pc_command_futures: dict[str, asyncio.Future] = {}  # LLM → PC Agent 往返
 last_active_esp32_id: str | None = None
 
+# Mobile H5 clients and latest sensor cache.
+app_clients: dict[str, WebSocket] = {}
+latest_sensor_data: dict | None = None
+sensor_poll_task: asyncio.Task | None = None
+SENSOR_POLL_INTERVAL_SEC = 2.0
+
 
 async def _pc_command_cb(action: str, params: dict, client_id: str, turn_id: int) -> str:
     """LLM 调 pc_command 工具时的回调：发命令到 PC Agent 并等结果。"""
@@ -262,6 +268,47 @@ def pick_esp32_client(client_id: str | None = None) -> str | None:
     if last_active_esp32_id and last_active_esp32_id in esp32_clients:
         return last_active_esp32_id
     return next(iter(esp32_clients.keys()), None)
+
+
+async def broadcast_to_apps(payload: dict) -> None:
+    """Broadcast JSON to all connected mobile H5 clients."""
+    dead: list[str] = []
+    text = json.dumps(payload, ensure_ascii=False)
+    for app_id, ws in list(app_clients.items()):
+        try:
+            await ws.send_text(text)
+        except Exception:
+            dead.append(app_id)
+    for app_id in dead:
+        app_clients.pop(app_id, None)
+
+
+async def request_sensor_data(client_id: str | None = None) -> bool:
+    """Ask the active ESP32 to return one sensor_data frame."""
+    target = pick_esp32_client(client_id)
+    if not target:
+        return False
+    return await send_json_to_esp32(target, {
+        "type": "read_sensors",
+        "request_id": f"app-{int(time.time() * 1000)}",
+    })
+
+
+async def sensor_poll_loop() -> None:
+    """Poll ESP32 only while at least one mobile H5 client is connected."""
+    while True:
+        try:
+            if app_clients:
+                await request_sensor_data()
+        except Exception as e:
+            print(f"[APP] sensor poll error: {e}")
+        await asyncio.sleep(SENSOR_POLL_INTERVAL_SEC)
+
+
+def ensure_sensor_poll_task() -> None:
+    global sensor_poll_task
+    if sensor_poll_task is None or sensor_poll_task.done():
+        sensor_poll_task = asyncio.create_task(sensor_poll_loop())
 
 
 def extract_search_query_from_url(url: str) -> str | None:
@@ -597,6 +644,20 @@ async def esp32_endpoint(websocket: WebSocket):
                     print(f"[ESP32] hello session_id={session_id}, version={data.get('version')}")
                     continue
 
+                if msg_type == "sensor_data":
+                    global latest_sensor_data
+                    latest_sensor_data = {
+                        "received_at": time.time(),
+                        "client_id": client_id,
+                        "data": data.get("data") or {},
+                    }
+                    await broadcast_to_apps({
+                        "type": "sensor_data",
+                        "esp32_connected": True,
+                        "latest": latest_sensor_data,
+                    })
+                    continue
+
                 if msg_type == "listen":
                     state = data.get("state")
                     if state == "start":
@@ -740,6 +801,71 @@ async def esp32_endpoint(websocket: WebSocket):
             last_active_esp32_id = pick_esp32_client()
 
 
+@app.get("/api/latest_sensors")
+async def api_latest_sensors():
+    return {
+        "ok": True,
+        "esp32_connected": bool(esp32_clients),
+        "app_clients": len(app_clients),
+        "latest": latest_sensor_data,
+    }
+
+
+@app.websocket("/ws/app")
+async def app_endpoint(websocket: WebSocket):
+    """Mobile H5 entry: receive live ESP32 sensor telemetry."""
+    await websocket.accept()
+    app_id = str(id(websocket))
+    app_clients[app_id] = websocket
+    ensure_sensor_poll_task()
+    print(f"[APP] connected ({app_id})")
+
+    await websocket.send_text(json.dumps({
+        "type": "app_hello",
+        "esp32_connected": bool(esp32_clients),
+        "latest": latest_sensor_data,
+    }, ensure_ascii=False))
+    await request_sensor_data()
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            msg_type = data.get("type")
+            if msg_type == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}, ensure_ascii=False))
+            elif msg_type == "read_sensors":
+                ok = await request_sensor_data(data.get("client_id"))
+                await websocket.send_text(json.dumps({
+                    "type": "read_sensors_ack",
+                    "ok": ok,
+                    "esp32_connected": bool(esp32_clients),
+                }, ensure_ascii=False))
+            elif msg_type == "pillow_cmd":
+                target = pick_esp32_client(data.get("client_id"))
+                payload = {
+                    "type": "pillow_cmd",
+                    "action": data.get("action"),
+                    "duration_sec": int(data.get("duration_sec") or 3),
+                }
+                if data.get("target_kpa") is not None:
+                    payload["target_kpa"] = float(data.get("target_kpa"))
+                ok = await send_json_to_esp32(target, payload) if target else False
+                await websocket.send_text(json.dumps({
+                    "type": "command_ack",
+                    "target": "pillow",
+                    "ok": ok,
+                }, ensure_ascii=False))
+    except WebSocketDisconnect:
+        print(f"[APP] disconnected ({app_id})")
+    finally:
+        app_clients.pop(app_id, None)
+
+
 @app.websocket("/ws/pc_agent")
 async def pc_agent_endpoint(websocket: WebSocket):
     """
@@ -832,6 +958,8 @@ async def health():
         "esp32_connected": bool(esp32_clients),
         "esp32_clients": len(esp32_clients),
         "pc_agents": len(pc_agents),
+        "app_clients": len(app_clients),
+        "has_sensor_data": latest_sensor_data is not None,
         "version": APP_VERSION,
     }
 
